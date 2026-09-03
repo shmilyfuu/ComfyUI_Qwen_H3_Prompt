@@ -197,6 +197,9 @@ class LlamaServer:
                 f"Run {installer} from the custom node directory."
             )
         self.log = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
+        log_dir = NODE_ROOT / "runtime" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        server_log = log_dir / "llama-server.log"
         arguments = [
             str(self.executable),
             "--model",
@@ -229,6 +232,11 @@ class LlamaServer:
             "1024",
             "--jinja",
             "--no-webui",
+            "--log-file",
+            str(server_log),
+            "--log-timestamps",
+            "--log-verbosity",
+            "4",
         ]
         if self.runtime_spec.fit:
             arguments.extend(
@@ -312,7 +320,7 @@ class LlamaServer:
         repetition_penalty: float,
         think_mode: bool,
         reasoning_effort: str,
-    ) -> tuple[str, dict[str, int]]:
+    ) -> tuple[str, str, dict[str, int]]:
         payload = {
             "model": "qwen3.8-27b",
             "messages": messages,
@@ -331,14 +339,26 @@ class LlamaServer:
         }
         if think_mode:
             payload["reasoning_effort"] = reasoning_effort
-        response = self._request("POST", "/v1/chat/completions", payload)
-        content = response["choices"][0]["message"].get("content") or ""
+        # response = self._request("POST", "/v1/chat/completions", payload)
+        # content = response["choices"][0]["message"].get("content") or ""
+        # if not content.strip():
+        #     raise RuntimeError(
+        #         "Qwen returned no final answer. Disable think mode or increase max_tokens so thinking does not consume the output budget."
+        #     )
+        # return content.strip(), response.get("usage", {})
+        response = self._request("POST", "/v1/chat/completions", payload, timeout=7200.0)
+
+        message = response["choices"][0]["message"]
+
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+
         if not content.strip():
             raise RuntimeError(
                 "Qwen returned no final answer. Disable think mode or increase max_tokens so thinking does not consume the output budget."
             )
-        return content.strip(), response.get("usage", {})
 
+        return content.strip(), reasoning.strip(), response.get("usage", {})
 
 class LlamaServerManager:
     """Owns the one llama.cpp child process used by this custom node."""
