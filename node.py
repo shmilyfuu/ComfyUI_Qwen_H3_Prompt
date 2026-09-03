@@ -290,13 +290,54 @@ class QwenH3Prompt(io.ComfyNode):
                     control_after_generate=True,
                     tooltip="ComfyUI seed. It is mapped deterministically to llama.cpp's 32-bit seed range.",
                 ),
-                io.Int.Input(
+                io.Combo.Input(
                     "max_tokens",
-                    default=8192,
+                    display_name="max_tokens",
+                    options=[
+                        "8192",
+                        "16384",
+                        "24576",
+                        "32768",
+                        "65536",
+                        "131072",
+                        "manual",
+                    ],
+                    default="24576",
+                    advanced=True,
+                    tooltip="Maximum generated tokens, including thinking when thinking mode is enabled. Preset values for max_tokens.",
+                ),
+                io.Int.Input(
+                    "max_tokens_manual",
+                    display_name="max_tokens_manual",
+                    default=24576,
                     min=256,
-                    max=8192,
+                    max=131072,
                     step=128,
-                    tooltip="Maximum generated tokens, including thinking when thinking mode is enabled.",
+                    advanced=True,
+                    tooltip="Used when max_tokens_preset is set to manual.",
+                ),
+                io.Combo.Input(
+                    "context_size",
+                    display_name="context_size",
+                    options=[
+                        "65536",
+                        "131072",
+                        "262144",
+                        "manual",
+                    ],
+                    default="65536",
+                    advanced=True,
+                    tooltip="llama.cpp context size. Changing this value reloads the local Qwen model. Preset values for llama.cpp context size.",
+                ),
+                io.Int.Input(
+                    "context_size_manual",
+                    display_name="context_size_manual",
+                    default=65536,
+                    min=16384,
+                    max=262144,
+                    step=8192,
+                    advanced=True,
+                    tooltip="Used when context_preset is set to manual.",
                 ),
                 io.Int.Input(
                     "video_sample_frames_per_sec",
@@ -344,6 +385,7 @@ class QwenH3Prompt(io.ComfyNode):
                 io.String.Output("h3_prompt"),
                 io.String.Output("selected_skill"),
                 io.String.Output("detected_mode"),
+                io.String.Output("thinking"),
             ],
         )
 
@@ -359,6 +401,9 @@ class QwenH3Prompt(io.ComfyNode):
         reasoning_effort,
         seed,
         max_tokens,
+        max_tokens_manual,
+        context_size,
+        context_size_manual,
         video_sample_frames_per_sec,
         force_unload_model,
         reference_images=None,
@@ -368,6 +413,7 @@ class QwenH3Prompt(io.ComfyNode):
         content = None
         messages = None
         repair_messages = None
+        thinking = ""
         LOGGER.info(
             "[Qwen H3] Node execution started | skill=%s | think_mode=%s | seed=%d | force_unload_model=%s",
             skill,
@@ -378,6 +424,18 @@ class QwenH3Prompt(io.ComfyNode):
         try:
             if not prompt.strip():
                 raise ValueError("prompt must not be empty")
+
+            resolved_max_tokens = (
+                int(max_tokens_manual)
+                if max_tokens == "manual"
+                else int(max_tokens)
+            )
+
+            resolved_context_size = (
+                int(context_size_manual)
+                if context_size == "manual"
+                else int(context_size)
+            )
 
             stage_started = time.perf_counter()
             LOGGER.info("[Qwen H3] Preparing multimodal input")
@@ -428,7 +486,12 @@ class QwenH3Prompt(io.ComfyNode):
                     model.name,
                     projector.name,
                 )
-                server, loaded_new = SERVER_MANAGER.acquire(model, projector)
+                # server, loaded_new = SERVER_MANAGER.acquire(model, projector)
+                server, loaded_new = SERVER_MANAGER.acquire(
+                    model,
+                    projector,
+                    context_size=resolved_context_size,
+                )
                 LOGGER.info(
                     "[Qwen H3] Model loading complete | %s | platform=%s | backend=%s | port=%d | elapsed %.2f s",
                     "new model loaded" if loaded_new else "resident model reused",
@@ -444,7 +507,7 @@ class QwenH3Prompt(io.ComfyNode):
                         "[Qwen H3] Starting automatic H3 mode routing | images=%d",
                         len(images),
                     )
-                    mode_selection, mode_usage = server.chat(
+                    mode_selection, _, mode_usage = server.chat(
                         mode_router_prompt(prompt, len(images)),
                         seed=seed,
                         max_tokens=16,
@@ -489,7 +552,7 @@ class QwenH3Prompt(io.ComfyNode):
                 if selected == "auto":
                     stage_started = time.perf_counter()
                     LOGGER.info("[Qwen H3] Starting automatic Skill routing")
-                    selection, routing_usage = server.chat(
+                    selection, _, routing_usage = server.chat(
                         router_prompt(prompt, mode, asset_summary),
                         seed=seed,
                         max_tokens=48,
@@ -524,15 +587,24 @@ class QwenH3Prompt(io.ComfyNode):
                 ]
                 stage_started = time.perf_counter()
                 LOGGER.info(
-                    "[Qwen H3] Inference started | mode=%s | skill=%s | max_tokens=%d",
+                    "[Qwen H3] Inference started | mode=%s | skill=%s | max_tokens=%d | context_size=%d",
                     mode,
                     selected,
-                    max_tokens,
+                    resolved_max_tokens,
+                    resolved_context_size,
                 )
-                result, inference_usage = server.chat(
+                # result, inference_usage = server.chat(
+                #     messages,
+                #     seed=seed,
+                #     max_tokens=max_tokens,
+                #     think_mode=think_mode,
+                #     reasoning_effort=reasoning_effort,
+                #     **settings,
+                # )
+                result, thinking, inference_usage = server.chat(
                     messages,
                     seed=seed,
-                    max_tokens=max_tokens,
+                    max_tokens=resolved_max_tokens,
                     think_mode=think_mode,
                     reasoning_effort=reasoning_effort,
                     **settings,
@@ -570,14 +642,36 @@ class QwenH3Prompt(io.ComfyNode):
                             ),
                         },
                     ]
-                    result, repair_usage = server.chat(
+                    # result, repair_usage = server.chat(
+                    #     repair_messages,
+                    #     seed=seed,
+                    #     max_tokens=max_tokens,
+                    #     think_mode=think_mode,
+                    #     reasoning_effort=reasoning_effort,
+                    #     **settings,
+                    # )
+                    repaired_result, repair_thinking, repair_usage = server.chat(
                         repair_messages,
                         seed=seed,
-                        max_tokens=max_tokens,
+                        max_tokens=resolved_max_tokens,
                         think_mode=think_mode,
                         reasoning_effort=reasoning_effort,
                         **settings,
                     )
+
+                    result = repaired_result
+
+                    if repair_thinking.strip():
+                        if thinking.strip():
+                            thinking = (
+                                thinking
+                                + "\n\n"
+                                + "===== AUTOMATIC REPAIR THINKING ====="
+                                + "\n\n"
+                                + repair_thinking
+                            )
+                        else:
+                            thinking = repair_thinking
                     LOGGER.info(
                         "[Qwen H3] Automatic repair inference complete | %s | elapsed %.2f s",
                         _usage_summary(repair_usage),
@@ -616,7 +710,7 @@ class QwenH3Prompt(io.ComfyNode):
                 f"[Qwen H3] Execution completed successfully | skill={selected} | mode={mode} | "
                 f"total elapsed {time.perf_counter() - total_started:.2f} s"
             )
-            return io.NodeOutput(result, selected, mode)
+            return io.NodeOutput(result, selected, mode, thinking)
         except Exception as error:
             content = None
             messages = None
